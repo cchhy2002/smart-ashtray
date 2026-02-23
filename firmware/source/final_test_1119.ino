@@ -63,6 +63,31 @@ uint8_t alwaysColorIndex = 0;
 unsigned long lastColorChangeMillis = 0;
 const unsigned long COLOR_CHANGE_INTERVAL = 1000; // 0.5초마다 색 변경
 
+
+// ==== 초음파 입력시 LED 업데이트를 위한 전역 상태 변수 ====
+enum AlwaysMode {
+  ALWAYS_MODE_IDLE,   // 평상시: 느리게 변화
+  ALWAYS_MODE_PUMP    // 펌프 ON 동안: 빠르게 여러 바퀴
+};
+
+AlwaysMode alwaysMode = ALWAYS_MODE_IDLE;
+
+// 공통으로 쓰는 타이머 (논리적인 Always_Update_Time)
+unsigned long lastAlwaysUpdateMillis = 0;
+
+// IDLE일 때 색 변경 간격
+const unsigned long ALWAYS_IDLE_INTERVAL = 1000;  // 예: 1초마다
+
+// PUMP ON 3초 동안 3바퀴 돌리고 싶다면:
+const uint8_t ALWAYS_TURNS_WHILE_PUMP = 3;  // 3바퀴
+const uint16_t ALWAYS_STEPS_WHILE_PUMP = ALWAYS_COLOR_COUNT * ALWAYS_TURNS_WHILE_PUMP;
+// 펌프 ON 동안 한 step당 간격
+const unsigned long ALWAYS_PUMP_INTERVAL = PUMP_ON_TIME / ALWAYS_STEPS_WHILE_PUMP;
+
+// 현재 펌프 동안 몇 step 진행했는지 (과하게 돌지 않게)
+uint16_t alwaysPumpStepCount = 0;
+
+
 enum SystemState {
   STATE_IDLE,        // 평상시: 색 계속 바뀜 + 트리거 감시
   STATE_PUMP_ON,     // 펌프 동작 중
@@ -95,6 +120,36 @@ void setAlwaysStripColor(uint8_t colorIndex) {
   }
   ledsAlways.show();
 }
+
+
+// ==== 초음파 입력시, Update 함수 ====
+void updateAlwaysStrip(unsigned long now) {
+  unsigned long interval;
+
+  if (alwaysMode == ALWAYS_MODE_IDLE) {
+    interval = ALWAYS_IDLE_INTERVAL;  // 느리게
+  } else { // ALWAYS_MODE_PUMP
+    interval = ALWAYS_PUMP_INTERVAL;  // 빠르게
+  }
+
+  if (now - lastAlwaysUpdateMillis >= interval) {
+    // 다음 색으로 한 칸 이동
+    alwaysColorIndex = (alwaysColorIndex + 1) % ALWAYS_COLOR_COUNT;
+    setAlwaysStripColor(alwaysColorIndex);
+
+    lastAlwaysUpdateMillis = now;
+
+    // 펌프 중일 때는 step 카운트도 올림 (원하면 제한 가능)
+    if (alwaysMode == ALWAYS_MODE_PUMP) {
+      alwaysPumpStepCount++;
+      // 굳이 제한하고 싶으면:
+      // if (alwaysPumpStepCount >= ALWAYS_STEPS_WHILE_PUMP) {
+      //   항상Mode를 IDLE로 돌리거나, 그냥 더 안돌게 해도 됨.
+      // }
+    }
+  }
+}
+
 
 void drawCentered(U8G2 &disp, int y, const char* text) {
   int16_t textWidth = disp.getStrWidth(text);
@@ -156,18 +211,10 @@ do {
 void loop() {
   unsigned long now = millis();
 
-  // 1) 상태에 따라 상시 LED 색 순환 (IDLE에서만)
-  if (systemState == STATE_IDLE) {
-    if (now - lastColorChangeMillis >= COLOR_CHANGE_INTERVAL) {
-      alwaysColorIndex = (alwaysColorIndex + 1) % ALWAYS_COLOR_COUNT;
-      setAlwaysStripColor(alwaysColorIndex);
-      lastColorChangeMillis = now;
-    }
-  }
-  // STATE_PUMP_ON / STATE_COOLDOWN에서는 색을 갱신하지 않으므로
-  // "지금 색에서 멈춘 상태"가 유지됨.
+  // 1) Always LED는 모든 상태에서 항상 이 함수로만 관리
+  updateAlwaysStrip(now);
 
-  // 2) 거리 측정 (예전과 동일, 다만 마지막 delay는 제거할 예정)
+  // 2) 거리 측정
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
@@ -181,14 +228,18 @@ void loop() {
   Serial.print(distance_cm);
   Serial.println(" cm");
 
-  // 3) 상태머신으로 펌프/트리거 LED 제어
+  // 3) 상태머신
   switch (systemState) {
     case STATE_IDLE:
-      // 평상시: 거리가 임계값 이하로 들어오면 트리거
       if (distance_cm <= TRIGGER_DISTANCE) {
-        Serial.println("Trigger detected");
+        Serial.println("Trigger detected → PUMP_ON");
 
-        // 트리거 LED 파란색 ON
+        // ★ 펌프 ON 들어갈 때: Always 모드를 PUMP로 전환
+        alwaysMode = ALWAYS_MODE_PUMP;
+        alwaysPumpStepCount = 0;            // 카운터 리셋
+        lastAlwaysUpdateMillis = now;       // 펌프용 기준 시간 재설정
+
+        // TRIG LED ON
         for (int i = 0; i < LED_TRIG_COUNT; i++) {
           ledsTrigger.setPixel(i, LED_TRIG_R, LED_TRIG_G, LED_TRIG_B);
         }
@@ -197,36 +248,41 @@ void loop() {
         // 펌프 ON
         digitalWrite(PUMP_PIN, HIGH);
         pumpStartMillis = now;
+
         systemState = STATE_PUMP_ON;
       } else {
-        digitalWrite(PUMP_PIN, LOW); // 안전상 한번 더 확인
+        digitalWrite(PUMP_PIN, LOW); // 안전용
       }
       break;
 
     case STATE_PUMP_ON:
-      // 펌프 ON 상태가 PUMP_ON_TIME만큼 유지되면 OFF로 전환
       if (now - pumpStartMillis >= PUMP_ON_TIME) {
+        // 펌프 OFF
         digitalWrite(PUMP_PIN, LOW);
 
-        // 트리거 LED OFF
+        // TRIG LED OFF
         ledsTrigger.clearAll();
         ledsTrigger.show();
 
-        // 재트리거 방지용 쿨다운 상태 진입
+        // ★ 펌프 끝날 때: Always 모드를 다시 IDLE로
+        alwaysMode = ALWAYS_MODE_IDLE;
+        lastAlwaysUpdateMillis = now;   // IDLE용 기준 시간 다시 잡기
+
         cooldownStartMillis = now;
         systemState = STATE_COOLDOWN;
       }
       break;
 
     case STATE_COOLDOWN:
-      // 쿨다운 시간 동안은 거리와 상관없이 아무 동작 안 함
       if (now - cooldownStartMillis >= COOLDOWN_TIME) {
         systemState = STATE_IDLE;
+        // IDLE 들어갈 때 추가로 뭔가 리셋하고 싶으면 여기서
       }
       break;
   }
 
-  // 4) loop 끝에서 큰 delay는 넣지 말고, 필요하면 아주 작은 delay만
-  delay(5); // 또는 아예 생략해도 무방
+  // 필요하면 소량 delay
+  delay(5);
 }
+
 
